@@ -1,0 +1,2016 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ---
+# Foundation State
+
+TOOL_NAMES=(python ruby node rg rtk codegraph uv serena)
+PACKAGE_MANAGER_NAMES=(apt-get dnf yum pacman zypper apk nix proto mise asdf brew)
+
+declare -A TOOL_COMMANDS=(
+	[python]="python3"
+	[ruby]="ruby"
+	[node]="node"
+	[rg]="rg"
+	[rtk]="rtk"
+	[codegraph]="codegraph"
+	[uv]="uv"
+	[serena]="serena"
+)
+
+declare -A TOOL_RESULTS=()
+declare -A TOOL_RESULT_DETAILS=()
+declare -A PACKAGE_MANAGER_RESULTS=()
+declare -A PACKAGE_MANAGER_RESULT_DETAILS=()
+declare -A NEW_TOOL_COMMANDS=()
+TOOL_FAILURE_COUNT=0
+STATUS_UNAVAILABLE_COUNT=0
+LAST_OPERATION_COMMAND=""
+FOUND_TOOL_COMMAND=""
+FOUND_TOOL_PATH=""
+FOUND_TOOL_VERSION=""
+LAST_VERIFICATION_DETAILS=""
+DEBUG_ENABLED=0
+
+DEV_TOOLS_MODE="install"
+DEV_TOOLS_AGENT="copilot"
+GLOBAL_INSTALL=0
+PROTO_TOOL_CAPABILITY_CACHE_FILE="${DEV_TOOLS_PROTO_CAPABILITY_CACHE:-${TMPDIR:-/tmp}/mydevsetup-proto-capability-$$}"
+
+: > "$PROTO_TOOL_CAPABILITY_CACHE_FILE"
+
+AGENTS_PATH="${DEV_TOOLS_AGENTS_PATH:-AGENTS.md}"
+SHELL_PROFILE_PATH="${DEV_TOOLS_SHELL_PROFILE:-${HOME:-}/.bashrc}"
+MANAGED_BLOCK_BEGIN='<!-- BEGIN MYDEVSETUP DEV TOOLS -->'
+MANAGED_BLOCK_END='<!-- END MYDEVSETUP DEV TOOLS -->'
+
+RTK_INSTALLER_URL="https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh"
+CODEGRAPH_INSTALLER_URL="https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh"
+UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
+
+# ---
+# Foundation Help
+
+print_usage() {
+	cat <<'USAGE'
+Usage:
+	dev-tools.sh [install|init|status] [--agent copilot|cursor] [--global] [--debug] [--dry-run]
+	dev-tools.sh --help
+
+Description:
+	Install missing development CLI tools, initialize installed tools for the current project, or display their current status.
+	The --agent option selects the agent-specific target for init mode. It is accepted in install mode for install.sh compatibility but does not affect installation; status ignores it.
+	The --global option is available only for install mode.
+	The --debug option prints external command traces for this run.
+	The --dry-run option previews install routes and commands without installing anything.
+
+Environment:
+	DEV_TOOLS_AGENTS_PATH  Override the AGENTS.md path for this run.
+	DEV_TOOLS_SHELL_PROFILE Override the Bash profile path for post-install activation.
+USAGE
+}
+
+# ---
+# Foundation Log
+
+log_info() {
+	printf '[INFO] %s\n' "$1"
+}
+
+supports_stdout_color() {
+	[[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]
+}
+
+supports_stderr_color() {
+	[[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]
+}
+
+log_warning() {
+	if supports_stdout_color; then
+		printf '\033[33m[⚠️WARNING] %s\033[0m\n' "$1"
+	else
+		printf '[⚠️WARNING] %s\n' "$1"
+	fi
+}
+
+log_error() {
+	if supports_stderr_color; then
+		printf '\033[31m[❌️ERROR] %s\033[0m\n' "$1" >&2
+	else
+		printf '[❌️ERROR] %s\n' "$1" >&2
+	fi
+}
+
+log_success() {
+	if supports_stdout_color; then
+		printf '\033[32m[✅️SUCCESS] %s\033[0m\n' "$1"
+	else
+		printf '[✅️SUCCESS] %s\n' "$1"
+	fi
+}
+
+log_debug() {
+	if [[ "$DEBUG_ENABLED" -eq 1 ]]; then
+		printf '[🔵DEBUG] %s\n' "$1" >&2
+	fi
+}
+
+format_command() {
+	local argument=""
+	local rendered_command=""
+	local rendered_argument=""
+
+	for argument in "$@"; do
+		printf -v rendered_argument '%q' "$argument"
+		if [[ -n "$rendered_command" ]]; then
+			rendered_command+=" "
+		fi
+		rendered_command+="$rendered_argument"
+	done
+
+	printf '%s' "$rendered_command"
+}
+
+record_operation_command() {
+	LAST_OPERATION_COMMAND="$(format_command "$@")"
+	log_debug "Running: $LAST_OPERATION_COMMAND"
+}
+
+run_recorded_command() {
+	record_operation_command "$@"
+	"$@"
+}
+
+record_pipeline_operation() {
+	LAST_OPERATION_COMMAND="$1"
+	log_debug "Running: $LAST_OPERATION_COMMAND"
+}
+
+# ---
+# Foundation Path and Detection
+
+prepend_path() {
+	local path_entry="$1"
+
+	if [[ ! -d "$path_entry" ]]; then
+		return 0
+	fi
+
+	case ":${PATH:-}:" in
+		*":$path_entry:"*)
+			return 0
+			;;
+	esac
+
+	PATH="$path_entry:${PATH:-}"
+	export PATH
+}
+
+prepare_known_tool_paths() {
+	local home_directory="${HOME:-}"
+
+	if [[ -n "$home_directory" ]]; then
+		prepend_path "$home_directory/.local/bin"
+		prepend_path "$home_directory/.proto/bin"
+		prepend_path "$home_directory/.asdf/shims"
+		prepend_path "$home_directory/.nix-profile/bin"
+		prepend_path "$home_directory/.local/share/mise/shims"
+	fi
+
+	prepend_path "/nix/var/nix/profiles/default/bin"
+}
+
+tool_command_candidates() {
+	local tool_name="$1"
+
+	case "$tool_name" in
+		python)
+			printf '%s\n' python3 python
+			;;
+		node)
+			printf '%s\n' node nodejs
+			;;
+		ruby|rg|rtk|codegraph|uv|serena)
+			printf '%s\n' "${TOOL_COMMANDS[$tool_name]}"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+extract_version_value() {
+	local version_output="$1"
+	local version_line=""
+	local version_value=""
+
+	while IFS= read -r version_line; do
+		[[ -n "$version_line" ]] || continue
+		if [[ "$version_line" =~ ([0-9]+([.][0-9]+)+[[:alnum:]_.+-]*) ]]; then
+			version_value="${BASH_REMATCH[1]}"
+		else
+			version_value="$version_line"
+		fi
+		printf '%s' "$version_value"
+		return 0
+	done <<< "$version_output"
+
+	return 0
+}
+
+find_verified_command() {
+	local candidate_function="$1"
+	local candidate_name="$2"
+	local command_name=""
+	local command_path=""
+	local verification_status=0
+	local verification_command=""
+	local verification_reason=""
+	local version_output=""
+
+	FOUND_TOOL_COMMAND=""
+	FOUND_TOOL_PATH=""
+	FOUND_TOOL_VERSION=""
+	LAST_VERIFICATION_DETAILS=""
+
+	while IFS= read -r command_name; do
+		verification_command="$(format_command "$command_name" --version)"
+		if ! command -v "$command_name" >/dev/null 2>&1; then
+			verification_status=127
+			verification_reason="command not found"
+			if [[ -n "$LAST_VERIFICATION_DETAILS" ]]; then
+				LAST_VERIFICATION_DETAILS+='; '
+			fi
+			LAST_VERIFICATION_DETAILS+="command: $verification_command (exit status $verification_status; $verification_reason)"
+			continue
+		fi
+
+		command_path="$(command -v "$command_name")"
+		record_operation_command "$command_name" --version
+		if version_output="$("$command_name" --version 2>&1)"; then
+			FOUND_TOOL_COMMAND="$command_name"
+			FOUND_TOOL_PATH="$command_path"
+			FOUND_TOOL_VERSION="$(extract_version_value "$version_output")"
+			return 0
+		else
+			verification_status="$?"
+		fi
+
+		verification_reason="command exited unsuccessfully"
+		if [[ -n "$LAST_VERIFICATION_DETAILS" ]]; then
+			LAST_VERIFICATION_DETAILS+='; '
+		fi
+		LAST_VERIFICATION_DETAILS+="command: $verification_command (exit status $verification_status; $verification_reason)"
+	done < <("$candidate_function" "$candidate_name")
+
+	return 1
+}
+
+find_tool_command() {
+	find_verified_command tool_command_candidates "$1"
+}
+
+package_manager_command_candidates() {
+	printf '%s\n' "$1"
+}
+
+find_package_manager_command() {
+	find_verified_command package_manager_command_candidates "$1"
+}
+
+format_present_tool_detail() {
+	local version="$1"
+	local path="$2"
+	local separator=""
+
+	if [[ -n "$version" ]]; then
+		printf '%s' "$version"
+		separator=" "
+	fi
+
+	if [[ -n "$path" ]]; then
+		printf '%s%s' "$separator" "$path"
+	fi
+}
+
+# ---
+# Domains Installation Routes
+
+system_manager_can_run() {
+	if [[ "$EUID" -eq 0 ]]; then
+		return 0
+	fi
+
+	command -v sudo >/dev/null 2>&1
+}
+
+find_system_package_manager() {
+	local manager_name=""
+
+	for manager_name in apt-get dnf yum pacman zypper apk; do
+		if ! command -v "$manager_name" >/dev/null 2>&1; then
+			continue
+		fi
+
+		if [[ "$manager_name" == "brew" ]] || system_manager_can_run; then
+			printf '%s' "$manager_name"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+system_package_for_tool() {
+	local tool_name="$1"
+	local manager_name="$2"
+
+	case "$tool_name:$manager_name" in
+		python:apt-get|python:dnf|python:yum|python:zypper|python:apk)
+			printf '%s' python3
+			;;
+		python:brew)
+			printf '%s' python
+			;;
+		python:pacman)
+			printf '%s' python
+			;;
+		node:apt-get|node:dnf|node:yum|node:pacman|node:zypper|node:apk)
+			printf '%s' nodejs
+			;;
+		node:brew)
+			printf '%s' node
+			;;
+		ruby:*)
+			printf '%s' ruby
+			;;
+		rg:*)
+			printf '%s' ripgrep
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+system_route_available() {
+	local tool_name="$1"
+	local manager_name=""
+
+	case "$tool_name" in
+		python|ruby|node|rg)
+			manager_name="$(find_system_package_manager)" || return 1
+			system_package_for_tool "$tool_name" "$manager_name" >/dev/null
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+	brew_package_for_tool() {
+		local tool_name="$1"
+
+		system_package_for_tool "$tool_name" brew
+	}
+
+	brew_route_available() {
+		local tool_name="$1"
+
+		command -v brew >/dev/null 2>&1 || return 1
+		brew_package_for_tool "$tool_name" >/dev/null
+	}
+
+nix_package_candidates() {
+	case "$1" in
+		serena)
+			return 1
+			;;
+		python)
+			printf '%s\n' python3 python
+			;;
+		node)
+			printf '%s\n' nodejs
+			;;
+		rg)
+			printf '%s\n' ripgrep rg
+			;;
+		*)
+			printf '%s\n' "$1"
+			;;
+	esac
+}
+
+nix_package_available() {
+	local package_name="$1"
+
+	nix eval --read-only --raw "nixpkgs#${package_name}.name" >/dev/null 2>&1
+}
+
+nix_package_for_tool() {
+	local tool_name="$1"
+	local package_name=""
+
+	while IFS= read -r package_name; do
+		if nix_package_available "$package_name"; then
+			printf '%s' "$package_name"
+			return 0
+		fi
+	done < <(nix_package_candidates "$tool_name")
+
+	return 1
+}
+
+nix_route_available() {
+	local tool_name="$1"
+
+	command -v nix >/dev/null 2>&1 || return 1
+	nix profile install --help >/dev/null 2>&1 || return 1
+	nix_package_for_tool "$tool_name" >/dev/null
+}
+
+proto_tool_candidates() {
+	case "$1" in
+		serena)
+			return 1
+			;;
+		rg)
+			printf '%s\n' ripgrep rg
+			;;
+		*)
+			printf '%s\n' "$1"
+			;;
+	esac
+}
+
+proto_capability_cache_lookup() {
+	local manager_tool="$1"
+	local cached_tool=""
+	local cached_result=""
+
+	while IFS=$'\t' read -r cached_tool cached_result; do
+		if [[ "$cached_tool" == "$manager_tool" ]]; then
+			printf '%s' "$cached_result"
+			return 0
+		fi
+	done < "$PROTO_TOOL_CAPABILITY_CACHE_FILE"
+
+	return 1
+}
+
+proto_capability_cache_store() {
+	local manager_tool="$1"
+	local capability_result="$2"
+
+	printf '%s\t%s\n' "$manager_tool" "$capability_result" >> "$PROTO_TOOL_CAPABILITY_CACHE_FILE"
+}
+
+proto_tool_for_tool() {
+	local tool_name="$1"
+	local manager_tool=""
+	local cached_result=""
+
+	while IFS= read -r manager_tool; do
+		if cached_result="$(proto_capability_cache_lookup "$manager_tool")"; then
+			if [[ "$cached_result" == 1 ]]; then
+				printf '%s' "$manager_tool"
+				return 0
+			fi
+			continue
+		fi
+
+		if proto versions "$manager_tool" --json >/dev/null 2>&1; then
+			proto_capability_cache_store "$manager_tool" 1
+			printf '%s' "$manager_tool"
+			return 0
+		fi
+
+		proto_capability_cache_store "$manager_tool" 0
+	done < <(proto_tool_candidates "$tool_name")
+
+	return 1
+}
+
+proto_build_mode_for_tool() {
+	case "$1" in
+		ruby)
+			printf '%s' '--build'
+			;;
+		python|node|rg|rtk|codegraph|uv)
+			printf '%s' '--no-build'
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+proto_build_excluded_packages_for_tool() {
+	local tool_name="$1"
+	local existing_packages="${PROTO_BUILD_EXCLUDE_PACKAGES:-}"
+	local package_status=""
+	local requested_package=""
+	local replacement_package=""
+	local -a alias_packages=()
+
+	case "$tool_name" in
+		ruby)
+		if ! command -v dpkg-query >/dev/null 2>&1; then
+			printf '%s' "$existing_packages"
+			return 0
+		fi
+
+		while IFS='|' read -r requested_package replacement_package; do
+			[[ -n "$requested_package" ]] || continue
+			package_status="$(dpkg-query -W -f='${Status}' "$replacement_package" 2>/dev/null || true)"
+			[[ "$package_status" == 'install ok installed' ]] || continue
+
+			case ",$existing_packages," in
+				*",$requested_package,"*)
+					;;
+				*)
+					alias_packages+=("$requested_package")
+					;;
+			esac
+		done <<'ALIASES'
+libreadline6-dev|libreadline-dev
+libncurses5-dev|libncurses-dev
+libgdbm6|libgdbm6t64
+ALIASES
+		;;
+	esac
+
+	if ((${#alias_packages[@]} > 0)); then
+		if [[ -n "$existing_packages" ]]; then
+			existing_packages+=','
+		fi
+		existing_packages+="$(IFS=,; printf '%s' "${alias_packages[*]}")"
+	fi
+
+	printf '%s' "$existing_packages"
+}
+
+proto_route_available() {
+	local tool_name="$1"
+
+	command -v proto >/dev/null 2>&1 || return 1
+	proto_build_mode_for_tool "$tool_name" >/dev/null || return 1
+	proto install --help >/dev/null 2>&1 || return 1
+	proto_tool_for_tool "$tool_name" >/dev/null
+}
+
+mise_tool_candidates() {
+	case "$1" in
+		serena)
+			return 1
+			;;
+		node)
+		printf '%s\n' node
+		;;
+		rg)
+		printf '%s\n' ripgrep rg
+		;;
+		*)
+		printf '%s\n' "$1"
+		;;
+	esac
+}
+
+mise_tool_for_tool() {
+	local tool_name="$1"
+	local manager_tool=""
+
+	while IFS= read -r manager_tool; do
+		if mise registry "$manager_tool" >/dev/null 2>&1; then
+			printf '%s' "$manager_tool"
+			return 0
+		fi
+	done < <(mise_tool_candidates "$tool_name")
+
+	return 1
+}
+
+mise_route_available() {
+	local tool_name="$1"
+
+	command -v mise >/dev/null 2>&1 || return 1
+	mise_tool_for_tool "$tool_name" >/dev/null
+}
+
+asdf_plugin_candidates() {
+	case "$1" in
+		serena)
+			return 1
+			;;
+		node)
+		printf '%s\n' nodejs
+		;;
+		rg)
+		printf '%s\n' ripgrep rg
+		;;
+		*)
+		printf '%s\n' "$1"
+		;;
+	esac
+}
+
+asdf_plugin_for_tool() {
+	local tool_name="$1"
+	local plugin_name=""
+	local installed_plugins=""
+
+	if ! installed_plugins="$(asdf plugin list 2>/dev/null)"; then
+		return 1
+	fi
+
+	while IFS= read -r plugin_name; do
+		if grep -Fxq "$plugin_name" <<< "$installed_plugins"; then
+			printf '%s' "$plugin_name"
+			return 0
+		fi
+	done < <(asdf_plugin_candidates "$tool_name")
+
+	return 1
+}
+
+asdf_route_available() {
+	local tool_name="$1"
+
+	command -v asdf >/dev/null 2>&1 || return 1
+	asdf_plugin_for_tool "$tool_name" >/dev/null
+}
+
+official_installer_url_for_tool() {
+	case "$1" in
+		rtk)
+		printf '%s' "$RTK_INSTALLER_URL"
+		;;
+		codegraph)
+		printf '%s' "$CODEGRAPH_INSTALLER_URL"
+		;;
+		uv)
+		printf '%s' "$UV_INSTALLER_URL"
+		;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+official_route_available() {
+	local tool_name="$1"
+
+	official_installer_url_for_tool "$tool_name" >/dev/null || return 1
+	if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+		return 0
+	fi
+
+	command -v curl >/dev/null 2>&1
+}
+
+uv_tool_package_for_tool() {
+	case "$1" in
+		serena)
+		printf '%s' serena-agent
+		;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+uv_tool_route_available() {
+	local tool_name="$1"
+
+	command -v uv >/dev/null 2>&1 || return 1
+	uv_tool_package_for_tool "$tool_name" >/dev/null
+}
+
+route_supports_global_scope() {
+	case "$1" in
+		system|nix|brew|official|uv-tool)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+append_available_route() {
+	local tool_name="$1"
+	local route_name="$2"
+	local route_available=0
+
+	if [[ "$GLOBAL_INSTALL" -eq 1 ]] && ! route_supports_global_scope "$route_name"; then
+		return 0
+	fi
+
+	case "$route_name" in
+		system)
+			if system_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		nix)
+			if nix_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		proto)
+			if proto_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		mise)
+			if mise_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		asdf)
+			if asdf_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		brew)
+			if brew_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		official)
+			if official_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		uv-tool)
+			if uv_tool_route_available "$tool_name"; then
+				route_available=1
+			fi
+			;;
+		*)
+			return 0
+			;;
+	esac
+
+	if [[ "$route_available" -eq 1 ]]; then
+		printf '%s\n' "$route_name"
+	fi
+}
+
+available_routes_for_tool() {
+	local tool_name="$1"
+
+	if [[ "$tool_name" == "serena" ]]; then
+		append_available_route "$tool_name" uv-tool
+		printf '%s\n' skip
+		return 0
+	fi
+
+	append_available_route "$tool_name" proto
+	append_available_route "$tool_name" nix
+	append_available_route "$tool_name" mise
+	append_available_route "$tool_name" asdf
+	append_available_route "$tool_name" brew
+	append_available_route "$tool_name" system
+	append_available_route "$tool_name" official
+	append_available_route "$tool_name" uv-tool
+
+	printf '%s\n' skip
+}
+
+default_route_for_tool() {
+	case "$1" in
+		python|ruby|node|rg|rtk|codegraph|uv)
+			printf '%s' proto
+			;;
+		serena)
+			printf '%s' uv-tool
+			;;
+		*)
+			printf '%s' skip
+			;;
+	esac
+}
+
+has_install_route() {
+	local tool_name="$1"
+	local route_name=""
+
+	while IFS= read -r route_name; do
+		if [[ "$route_name" != "skip" ]]; then
+			return 0
+		fi
+	done < <(available_routes_for_tool "$tool_name")
+
+	return 1
+}
+
+report_no_install_route() {
+	local tool_name="$1"
+
+	if [[ "$tool_name" == "serena" ]]; then
+		log_info "Serena is installed via uv; skipping because uv is unavailable"
+	else
+		log_warning "No installation method is available for $tool_name; skipping"
+	fi
+}
+
+default_available_route_for_tool() {
+	local tool_name="$1"
+	local configured_default_route="$(default_route_for_tool "$tool_name")"
+	local route_name=""
+
+	while IFS= read -r route_name; do
+		if [[ "$route_name" == "$configured_default_route" ]]; then
+			printf '%s' "$configured_default_route"
+			return 0
+		fi
+	done < <(available_routes_for_tool "$tool_name")
+
+	while IFS= read -r route_name; do
+		if [[ "$route_name" != "skip" ]]; then
+			printf '%s' "$route_name"
+			return 0
+		fi
+	done < <(available_routes_for_tool "$tool_name")
+
+	printf '%s' skip
+}
+
+prompt_is_available() {
+	[[ -t 0 || -t 1 ]]
+}
+
+prompt_for_route() {
+	local tool_name="$1"
+	local prompt_input="/dev/tty"
+	local prompt_output="/dev/tty"
+	local configured_default_route="$(default_route_for_tool "$tool_name")"
+	local default_route="skip"
+	local answer=""
+	local selected_route="skip"
+	local route_name=""
+	local index=0
+	local route_count=0
+	local -a routes=()
+
+	while IFS= read -r route_name; do
+		routes+=("$route_name")
+	done < <(available_routes_for_tool "$tool_name")
+
+	for route_name in "${routes[@]}"; do
+		if [[ "$route_name" == "$configured_default_route" ]]; then
+			default_route="$configured_default_route"
+			break
+		fi
+	done
+	if [[ "$default_route" == "skip" ]]; then
+		for route_name in "${routes[@]}"; do
+			if [[ "$route_name" != "skip" ]]; then
+				default_route="$route_name"
+				break
+			fi
+		done
+	fi
+
+	if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+		prompt_input="/dev/stdin"
+		prompt_output="/dev/stdout"
+	fi
+
+	printf 'Choose an installation method for %s [default: %s]:\n' "$tool_name" "$default_route" > "$prompt_output"
+	for index in "${!routes[@]}"; do
+		route_name="${routes[$index]}"
+		if [[ "$route_name" == "$default_route" ]]; then
+			printf '%s\n' "  $((index + 1))) $route_name (default)" > "$prompt_output"
+		else
+			printf '%s\n' "  $((index + 1))) $route_name" > "$prompt_output"
+		fi
+	done
+
+	route_count="${#routes[@]}"
+	printf 'Selection: ' > "$prompt_output"
+	read -r answer < "$prompt_input" || answer=""
+
+	if [[ -z "$answer" ]]; then
+		for route_name in "${routes[@]}"; do
+			if [[ "$route_name" == "$default_route" ]]; then
+				selected_route="$default_route"
+				break
+			fi
+		done
+	elif [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= route_count )); then
+		selected_route="${routes[$((answer - 1))]}"
+	else
+		for route_name in "${routes[@]}"; do
+			if [[ "$route_name" == "$answer" ]]; then
+				selected_route="$answer"
+				break
+			fi
+		done
+	fi
+
+	printf '%s' "$selected_route"
+}
+
+# ---
+# Actions Install
+
+run_as_root() {
+	local -a command=("$@")
+
+	if [[ "$EUID" -ne 0 ]]; then
+		command=(sudo "${command[@]}")
+	fi
+
+	run_recorded_command "${command[@]}"
+}
+
+install_with_system() {
+	local tool_name="$1"
+	local manager_name="$(find_system_package_manager)"
+	local package_name="$(system_package_for_tool "$tool_name" "$manager_name")"
+
+	case "$manager_name" in
+		apt-get|dnf|yum)
+			run_as_root "$manager_name" install -y "$package_name" || return $?
+			;;
+		pacman)
+			run_as_root "$manager_name" -S --noconfirm "$package_name" || return $?
+			;;
+		zypper)
+			run_as_root "$manager_name" --non-interactive install --no-recommends "$package_name" || return $?
+			;;
+		apk)
+			run_as_root "$manager_name" add --no-cache "$package_name" || return $?
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+install_with_brew() {
+	local tool_name="$1"
+	local package_name="$(brew_package_for_tool "$tool_name")"
+
+	run_recorded_command brew install "$package_name" || return $?
+}
+
+install_with_nix() {
+	local tool_name="$1"
+	local package_name="$(nix_package_for_tool "$tool_name")"
+
+	run_recorded_command nix profile install "nixpkgs#$package_name" || return $?
+	prepend_path "${HOME:-}/.nix-profile/bin"
+	prepend_path "/nix/var/nix/profiles/default/bin"
+}
+
+install_with_proto() {
+	local tool_name="$1"
+	local manager_tool="$(proto_tool_for_tool "$tool_name")"
+	local build_mode="$(proto_build_mode_for_tool "$tool_name")"
+	local excluded_packages="$(proto_build_excluded_packages_for_tool "$tool_name")"
+	local executable_path=""
+
+	if [[ -n "$excluded_packages" ]]; then
+		run_recorded_command env "PROTO_BUILD_EXCLUDE_PACKAGES=$excluded_packages" proto install "$manager_tool" latest "$build_mode" --yes || return $?
+	else
+		run_recorded_command proto install "$manager_tool" latest "$build_mode" --yes || return $?
+	fi
+	record_operation_command proto bin "$manager_tool" latest
+	if executable_path="$(proto bin "$manager_tool" latest 2>/dev/null)"; then
+		:
+	else
+		return $?
+	fi
+
+	[[ -x "$executable_path" ]] || return 1
+	prepend_path "$(dirname "$executable_path")"
+}
+
+refresh_mise_path() {
+	local manager_tool="$1"
+	local path_entry=""
+
+	record_operation_command mise bin-paths "$manager_tool@latest"
+	while IFS= read -r path_entry; do
+		prepend_path "$path_entry"
+	done < <(mise bin-paths "$manager_tool@latest" 2>/dev/null || true)
+}
+
+install_with_mise() {
+	local tool_name="$1"
+	local manager_tool="$(mise_tool_for_tool "$tool_name")"
+
+	run_recorded_command mise install "$manager_tool@latest" || return $?
+	refresh_mise_path "$manager_tool"
+}
+
+install_with_asdf() {
+	local tool_name="$1"
+	local plugin_name="$(asdf_plugin_for_tool "$tool_name")"
+	local version=""
+	local environment_name=""
+
+	run_recorded_command asdf install "$plugin_name" latest || return $?
+	record_operation_command asdf latest "$plugin_name"
+	if version="$(asdf latest "$plugin_name")"; then
+		:
+	else
+		return $?
+	fi
+
+	[[ -n "$version" ]] || return 1
+	run_recorded_command asdf reshim "$plugin_name" "$version" || return $?
+	environment_name="ASDF_${plugin_name^^}_VERSION"
+	export "$environment_name=$version"
+	prepend_path "${ASDF_DATA_DIR:-${HOME:-}/.asdf}/shims"
+}
+
+install_with_official() {
+	local tool_name="$1"
+	local installer_url="$(official_installer_url_for_tool "$tool_name")"
+	local pipeline_command=""
+
+	pipeline_command="$(format_command curl --proto '=https' --tlsv1.2 -fsSL "$installer_url") | sh"
+	record_pipeline_operation "$pipeline_command"
+	if curl --proto '=https' --tlsv1.2 -fsSL "$installer_url" | sh; then
+		:
+	else
+		return $?
+	fi
+
+	prepend_path "${HOME:-}/.local/bin"
+}
+
+refresh_uv_tool_path() {
+	local tool_bin_directory=""
+
+	record_operation_command uv tool dir --bin
+	if tool_bin_directory="$(uv tool dir --bin 2>/dev/null)"; then
+		:
+	else
+		return $?
+	fi
+
+	[[ -n "$tool_bin_directory" ]] || return 1
+	prepend_path "$tool_bin_directory"
+}
+
+install_with_uv_tool() {
+	local tool_name="$1"
+	local package_name="$(uv_tool_package_for_tool "$tool_name")"
+
+	run_recorded_command uv tool install -p 3.13 "$package_name" || return $?
+	refresh_uv_tool_path
+}
+
+planned_install_command_for_route() {
+	local tool_name="$1"
+	local route_name="$2"
+	local manager_name=""
+	local package_name=""
+	local manager_tool=""
+	local build_mode=""
+	local plugin_name=""
+	local installer_url=""
+	local pipeline_command=""
+	local -a planned_command=()
+
+	case "$route_name" in
+		system)
+		manager_name="$(find_system_package_manager)" || return 1
+		package_name="$(system_package_for_tool "$tool_name" "$manager_name")" || return 1
+		case "$manager_name" in
+			apt-get|dnf|yum)
+				planned_command=("$manager_name" install -y "$package_name")
+				;;
+			pacman)
+				planned_command=("$manager_name" -S --noconfirm "$package_name")
+				;;
+			zypper)
+				planned_command=("$manager_name" --non-interactive install --no-recommends "$package_name")
+				;;
+			apk)
+				planned_command=("$manager_name" add --no-cache "$package_name")
+				;;
+			*)
+				return 1
+				;;
+		esac
+		if [[ "$EUID" -ne 0 ]]; then
+			planned_command=(sudo "${planned_command[@]}")
+		fi
+		format_command "${planned_command[@]}"
+		;;
+		brew)
+		package_name="$(brew_package_for_tool "$tool_name")" || return 1
+		format_command brew install "$package_name"
+		;;
+		nix)
+		package_name="$(nix_package_for_tool "$tool_name")" || return 1
+		format_command nix profile install "nixpkgs#$package_name"
+		;;
+		proto)
+		manager_tool="$(proto_tool_for_tool "$tool_name")" || return 1
+			build_mode="$(proto_build_mode_for_tool "$tool_name")" || return 1
+			local excluded_packages="$(proto_build_excluded_packages_for_tool "$tool_name")"
+			if [[ -n "$excluded_packages" ]]; then
+				format_command env "PROTO_BUILD_EXCLUDE_PACKAGES=$excluded_packages" proto install "$manager_tool" latest "$build_mode" --yes
+			else
+				format_command proto install "$manager_tool" latest "$build_mode" --yes
+			fi
+		;;
+		mise)
+		manager_tool="$(mise_tool_for_tool "$tool_name")" || return 1
+		format_command mise install "$manager_tool@latest"
+		;;
+		asdf)
+		plugin_name="$(asdf_plugin_for_tool "$tool_name")" || return 1
+		format_command asdf install "$plugin_name" latest
+		;;
+		official)
+		installer_url="$(official_installer_url_for_tool "$tool_name")" || return 1
+		pipeline_command="$(format_command curl --proto '=https' --tlsv1.2 -fsSL "$installer_url") | sh"
+		printf '%s' "$pipeline_command"
+		;;
+		uv-tool)
+		package_name="$(uv_tool_package_for_tool "$tool_name")" || return 1
+		format_command uv tool install -p 3.13 "$package_name"
+		;;
+		*)
+		return 1
+		;;
+	esac
+}
+
+install_with_route() {
+	local tool_name="$1"
+	local route_name="$2"
+
+	case "$route_name" in
+		system)
+		install_with_system "$tool_name"
+		;;
+		nix)
+		install_with_nix "$tool_name"
+		;;
+		proto)
+		install_with_proto "$tool_name"
+		;;
+		mise)
+		install_with_mise "$tool_name"
+		;;
+		asdf)
+		install_with_asdf "$tool_name"
+		;;
+		brew)
+		install_with_brew "$tool_name"
+		;;
+		official)
+		install_with_official "$tool_name"
+		;;
+		uv-tool)
+		install_with_uv_tool "$tool_name"
+		;;
+		*)
+		return 1
+		;;
+	esac
+}
+
+append_shell_profile_line() {
+	local profile_line="$1"
+	local profile_directory=""
+
+	if [[ -z "$SHELL_PROFILE_PATH" ]]; then
+		log_error "Cannot update the shell profile: no profile path is configured"
+		return 1
+	fi
+
+	if [[ -L "$SHELL_PROFILE_PATH" ]]; then
+		log_error "Cannot safely update the shell profile: $SHELL_PROFILE_PATH"
+		return 1
+	fi
+
+	if [[ -e "$SHELL_PROFILE_PATH" && ( ! -f "$SHELL_PROFILE_PATH" || ! -r "$SHELL_PROFILE_PATH" ) ]]; then
+		log_error "Cannot safely update the shell profile: $SHELL_PROFILE_PATH"
+		return 1
+	fi
+
+	profile_directory="$(dirname "$SHELL_PROFILE_PATH")"
+	if [[ ! -d "$profile_directory" ]]; then
+		mkdir -p "$profile_directory" || return 1
+	fi
+
+	if [[ ! -e "$SHELL_PROFILE_PATH" ]]; then
+		: > "$SHELL_PROFILE_PATH" || return 1
+	fi
+
+	if [[ ! -w "$SHELL_PROFILE_PATH" ]]; then
+		log_error "Cannot safely update the shell profile: $SHELL_PROFILE_PATH"
+		return 1
+	fi
+
+	if grep -Fqx -- "$profile_line" "$SHELL_PROFILE_PATH"; then
+		return 0
+	fi
+
+	record_pipeline_operation "append $profile_line to $SHELL_PROFILE_PATH"
+	if [[ -s "$SHELL_PROFILE_PATH" ]]; then
+		printf '\n' >> "$SHELL_PROFILE_PATH" || return 1
+	fi
+	printf '%s\n' "$profile_line" >> "$SHELL_PROFILE_PATH" || return 1
+}
+
+run_manager_shell_activation() {
+	local manager_name="$1"
+	local activation_script=""
+
+	record_pipeline_operation "$manager_name activate bash"
+	if activation_script="$("$manager_name" activate bash)"; then
+		:
+	else
+		return $?
+	fi
+
+	eval "$activation_script"
+}
+
+post_install_setup() {
+	local tool_name="$1"
+	local route_name="$2"
+	local manager_tool=""
+	local profile_line=""
+
+	if [[ "$GLOBAL_INSTALL" -eq 1 ]]; then
+		return 0
+	fi
+
+	case "$route_name" in
+		proto)
+		manager_tool="$(proto_tool_for_tool "$tool_name")" || return 1
+		log_info "Completing post-install setup for $tool_name via proto"
+		if run_recorded_command proto pin "$manager_tool" latest --resolve --to user; then
+			:
+		else
+			return $?
+		fi
+		if run_manager_shell_activation proto; then
+			:
+		else
+			return $?
+		fi
+		profile_line='eval "$(proto activate bash)"'
+		;;
+		mise)
+		manager_tool="$(mise_tool_for_tool "$tool_name")" || return 1
+		log_info "Completing post-install setup for $tool_name via mise"
+		if run_recorded_command mise use --global "$manager_tool@latest"; then
+			:
+		else
+			return $?
+		fi
+		refresh_mise_path "$manager_tool"
+		if run_manager_shell_activation mise; then
+			:
+		else
+			return $?
+		fi
+		profile_line='eval "$(mise activate bash)"'
+		;;
+		*)
+		return 0
+		;;
+	esac
+
+	if append_shell_profile_line "$profile_line"; then
+		:
+	else
+		return $?
+	fi
+
+	log_success "$tool_name is ready in this shell and future Bash sessions"
+}
+
+# ---
+# Actions Init
+
+run_project_initialization() {
+	local tool_name="$1"
+	local command_name="$2"
+
+	case "$tool_name" in
+		rtk)
+			case "$DEV_TOOLS_AGENT" in
+				copilot)
+					run_recorded_command "$command_name" init --copilot --no-patch
+				;;
+				cursor)
+					run_recorded_command "$command_name" init --global --agent cursor --no-patch
+				;;
+				*)
+				return 2
+				;;
+			esac
+		;;
+		codegraph)
+			case "$DEV_TOOLS_AGENT" in
+				cursor)
+					run_recorded_command "$command_name" install --target=cursor --location=local --yes || return $?
+				;;
+				copilot)
+				log_info "CodeGraph has no Copilot target; skipping agent configuration"
+				;;
+				*)
+				return 2
+				;;
+			esac
+			run_recorded_command "$command_name" init
+		;;
+		serena)
+			run_recorded_command "$command_name" init || return $?
+			run_recorded_command "$command_name" project index || return $?
+			run_recorded_command "$command_name" start-mcp-server --help
+		;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# ---
+# Actions Tool Processing
+
+set_tool_result() {
+	local tool_name="$1"
+	local result_name="$2"
+	local result_detail="$3"
+
+	TOOL_RESULTS["$tool_name"]="$result_name"
+	TOOL_RESULT_DETAILS["$tool_name"]="$result_detail"
+	if [[ "$result_name" == "failed" ]]; then
+		TOOL_FAILURE_COUNT=$((TOOL_FAILURE_COUNT + 1))
+	fi
+}
+
+process_dry_run_tool() {
+	local tool_name="$1"
+	local selected_route=""
+	local planned_command=""
+
+	if find_tool_command "$tool_name"; then
+		set_tool_result "$tool_name" present "$FOUND_TOOL_COMMAND"
+		log_info "$tool_name is already available as $FOUND_TOOL_COMMAND"
+		return 0
+	fi
+
+	if ! has_install_route "$tool_name"; then
+		set_tool_result "$tool_name" skipped "no available installation method"
+		report_no_install_route "$tool_name"
+		return 0
+	fi
+
+	if prompt_is_available; then
+		selected_route="$(prompt_for_route "$tool_name")"
+	else
+		selected_route="$(default_available_route_for_tool "$tool_name")"
+	fi
+
+	if [[ "$selected_route" == "skip" || -z "$selected_route" ]]; then
+		set_tool_result "$tool_name" skipped "selected skip"
+		return 0
+	fi
+
+	if planned_command="$(planned_install_command_for_route "$tool_name" "$selected_route")"; then
+		set_tool_result "$tool_name" planned "$selected_route: $planned_command"
+		log_info "Would install $tool_name via $selected_route: $planned_command"
+		return 0
+	fi
+
+	set_tool_result "$tool_name" failed "$selected_route (preview command generation failed)"
+	log_error "Could not preview $tool_name via $selected_route"
+}
+
+process_install_tool() {
+	local tool_name="$1"
+	local installed_command=""
+	local selected_route=""
+	local operation_status=0
+	local operation_command=""
+	local verification_detail=""
+
+	if [[ "$DRY_RUN" -eq 1 ]]; then
+		process_dry_run_tool "$tool_name"
+		return 0
+	fi
+
+	if find_tool_command "$tool_name"; then
+		installed_command="$FOUND_TOOL_COMMAND"
+		set_tool_result "$tool_name" present "$installed_command"
+		log_info "$tool_name is already available as $installed_command"
+		return 0
+	fi
+
+	if ! has_install_route "$tool_name"; then
+		set_tool_result "$tool_name" skipped "no available installation method"
+		report_no_install_route "$tool_name"
+		return 0
+	fi
+
+	if ! prompt_is_available; then
+		set_tool_result "$tool_name" skipped "non-interactive execution"
+		log_warning "Non-interactive execution detected; skipping $tool_name"
+		return 0
+	fi
+
+	selected_route="$(prompt_for_route "$tool_name")"
+	if [[ "$selected_route" == "skip" ]]; then
+		set_tool_result "$tool_name" skipped "selected skip"
+		return 0
+	fi
+
+	if install_with_route "$tool_name" "$selected_route"; then
+		:
+	else
+		operation_status="$?"
+		operation_command="${LAST_OPERATION_COMMAND:-unknown command}"
+		set_tool_result "$tool_name" failed "$selected_route (exit status $operation_status; command: $operation_command)"
+		log_error "Failed to install $tool_name via $selected_route (exit status $operation_status; command: $operation_command)"
+		return 0
+	fi
+
+	if post_install_setup "$tool_name" "$selected_route"; then
+		:
+	else
+		operation_status="$?"
+		operation_command="${LAST_OPERATION_COMMAND:-unknown post-install setup command}"
+		set_tool_result "$tool_name" failed "$selected_route (post-install setup failed; exit status $operation_status; command: $operation_command)"
+		log_error "Installed $tool_name via $selected_route but post-install setup failed (exit status $operation_status; command: $operation_command)"
+		return 0
+	fi
+
+	if ! find_tool_command "$tool_name"; then
+		verification_detail="${LAST_VERIFICATION_DETAILS:-unknown command verification failure}"
+		set_tool_result "$tool_name" failed "$selected_route (command verification failed; $verification_detail)"
+		log_error "Installed $tool_name via $selected_route but command verification failed; $verification_detail"
+		return 0
+	fi
+
+	installed_command="$FOUND_TOOL_COMMAND"
+	NEW_TOOL_COMMANDS["$tool_name"]="$installed_command"
+	set_tool_result "$tool_name" installed "$installed_command via $selected_route"
+	log_success "Installed $tool_name as $installed_command via $selected_route"
+}
+
+process_init_tool() {
+	local tool_name="$1"
+	local installed_command=""
+	local operation_status=0
+	local operation_command=""
+
+	case "$tool_name" in
+		rtk|codegraph|serena)
+			;;
+		uv)
+			set_tool_result "$tool_name" skipped "install-only tool"
+			log_info "$tool_name is install-only; skipping project initialization"
+			return 0
+			;;
+		*)
+			set_tool_result "$tool_name" skipped "no project initialization required"
+			log_info "$tool_name does not require project initialization"
+			return 0
+			;;
+	esac
+
+	if ! find_tool_command "$tool_name"; then
+		set_tool_result "$tool_name" skipped "command not available"
+		log_warning "$tool_name is not available; skipping project initialization"
+		return 0
+	fi
+
+	installed_command="$FOUND_TOOL_COMMAND"
+
+	if run_project_initialization "$tool_name" "$installed_command"; then
+		:
+	else
+		operation_status="$?"
+		operation_command="${LAST_OPERATION_COMMAND:-unknown command}"
+		set_tool_result "$tool_name" failed "project initialization failed (exit status $operation_status; command: $operation_command)"
+		log_error "Failed to initialize $tool_name for the current project (exit status $operation_status; command: $operation_command)"
+		return 0
+	fi
+
+	set_tool_result "$tool_name" initialized "$installed_command"
+	log_success "Initialized $tool_name for the current project"
+}
+
+process_status_tool() {
+	local tool_name="$1"
+	local status_detail=""
+	local verification_detail=""
+
+	if find_tool_command "$tool_name"; then
+		status_detail="$(format_present_tool_detail "$FOUND_TOOL_VERSION" "$FOUND_TOOL_PATH")"
+		set_tool_result "$tool_name" present "$status_detail"
+		return 0
+	fi
+
+	verification_detail="${LAST_VERIFICATION_DETAILS:-unknown command verification failure}"
+	set_tool_result "$tool_name" unavailable "$verification_detail"
+	STATUS_UNAVAILABLE_COUNT=$((STATUS_UNAVAILABLE_COUNT + 1))
+}
+
+process_package_manager_status() {
+	local manager_name=""
+	local status_detail=""
+	local verification_detail=""
+
+	for manager_name in "${PACKAGE_MANAGER_NAMES[@]}"; do
+		if find_package_manager_command "$manager_name"; then
+			status_detail="$(format_present_tool_detail "$FOUND_TOOL_VERSION" "$FOUND_TOOL_PATH")"
+			PACKAGE_MANAGER_RESULTS["$manager_name"]="present"
+			PACKAGE_MANAGER_RESULT_DETAILS["$manager_name"]="$status_detail"
+			continue
+		fi
+
+		verification_detail="${LAST_VERIFICATION_DETAILS:-unknown command verification failure}"
+		PACKAGE_MANAGER_RESULTS["$manager_name"]="unavailable"
+		PACKAGE_MANAGER_RESULT_DETAILS["$manager_name"]="$verification_detail"
+	done
+}
+
+process_tool() {
+	case "$DEV_TOOLS_MODE" in
+	init)
+		process_init_tool "$1"
+		;;
+	status)
+		process_status_tool "$1"
+		;;
+	*)
+		process_install_tool "$1"
+		;;
+	esac
+}
+
+# ---
+# Utils AGENTS.md
+
+agents_tool_is_verified() {
+	local tool_name="$1"
+	local result_name="${TOOL_RESULTS[$tool_name]:-}"
+
+	case "$result_name" in
+		present|installed)
+			return 0
+			;;
+		*)
+			[[ -n "${NEW_TOOL_COMMANDS[$tool_name]:-}" ]]
+			;;
+	esac
+}
+
+agents_command_for_tool() {
+	local tool_name="$1"
+	local result_name="${TOOL_RESULTS[$tool_name]:-}"
+	local command_name=""
+
+	if [[ "$result_name" == "installed" ]]; then
+		command_name="${NEW_TOOL_COMMANDS[$tool_name]:-}"
+	elif [[ "$result_name" == "present" ]]; then
+		command_name="${TOOL_RESULT_DETAILS[$tool_name]:-}"
+	fi
+
+	if [[ -z "$command_name" ]]; then
+		command_name="${NEW_TOOL_COMMANDS[$tool_name]:-${TOOL_RESULT_DETAILS[$tool_name]:-${TOOL_COMMANDS[$tool_name]:-}}}"
+	fi
+
+	printf '%s\n' "$command_name"
+}
+
+agents_contains_tool() {
+	local tool_name="$1"
+	local pattern=""
+
+	[[ -f "$AGENTS_PATH" ]] || return 1
+
+	case "$tool_name" in
+		python)
+			pattern='(^|[^[:alnum:]_-])python(3)?([^[:alnum:]_-]|$)'
+			;;
+		node)
+			pattern='(^|[^[:alnum:]_-])node(js)?([^[:alnum:]_-]|$)'
+			;;
+		rg)
+			pattern='(^|[^[:alnum:]_-])(rg|ripgrep)([^[:alnum:]_-]|$)'
+			;;
+		*)
+			pattern="(^|[^[:alnum:]_-])${tool_name}([^[:alnum:]_-]|$)"
+			;;
+	esac
+
+	grep -Eqi "$pattern" "$AGENTS_PATH"
+}
+
+agents_display_name_for_tool() {
+	local tool_name="$1"
+
+	case "$tool_name" in
+		rg)
+			printf '%s\n' ripgrep
+			;;
+		*)
+			printf '%s\n' "$tool_name"
+			;;
+	esac
+}
+
+agents_description_for_tool() {
+	local tool_name="$1"
+
+	case "$tool_name" in
+		rg)
+			printf '%s\n' 'Fast Rust line-oriented recursive regex search; respects .gitignore and skips hidden/binary files by default. Use rg -uuu to disable filtering.'
+			;;
+		rtk)
+			printf '%s\n' 'High-performance output-filtering/compression proxy for LLM context. Use rtk --help; useful subcommands include ls, tree, read, git, psql, pnpm, json, env, find, diff, log, grep, and npx.'
+			;;
+		codegraph)
+			printf '%s\n' 'Maps code to tests, breakage, affected flows, and business-logic risk.'
+			;;
+	esac
+}
+
+agents_entry_for_tool() {
+	local tool_name="$1"
+	local command_name=""
+	local display_name=""
+	local description=""
+
+	command_name="$(agents_command_for_tool "$tool_name")"
+	display_name="$(agents_display_name_for_tool "$tool_name")"
+	description="$(agents_description_for_tool "$tool_name")"
+
+	if [[ -n "$description" ]]; then
+		printf -- '- `%s`: `%s` - %s\n' "$display_name" "$command_name" "$description"
+	else
+		printf -- '- `%s`: `%s`\n' "$display_name" "$command_name"
+	fi
+}
+
+build_missing_agents_entries() {
+	local tool_name=""
+
+	for tool_name in "${TOOL_NAMES[@]}"; do
+		if ! agents_tool_is_verified "$tool_name"; then
+			continue
+		fi
+
+		if agents_contains_tool "$tool_name"; then
+			continue
+		fi
+
+		agents_entry_for_tool "$tool_name"
+	done
+}
+
+build_managed_agents_replacements() {
+	local tool_name=""
+	local display_name=""
+	local description=""
+
+	for tool_name in "${TOOL_NAMES[@]}"; do
+		if ! agents_tool_is_verified "$tool_name"; then
+			continue
+		fi
+
+		display_name="$(agents_display_name_for_tool "$tool_name")"
+		description="$(agents_description_for_tool "$tool_name")"
+		printf '%s\t%s\t%s\n' "$tool_name" "$display_name" "$description"
+		if [[ "$tool_name" == "rg" ]]; then
+			printf '%s\t%s\t%s\n' "$display_name" "$display_name" "$description"
+		fi
+	done
+}
+
+update_agents_managed_block() {
+	local additions_file=""
+	local replacements_file=""
+	local temporary_file=""
+	local addition_count=0
+	local replacement_count=0
+	local begin_count=0
+	local end_count=0
+	local agents_directory=""
+	local last_byte=""
+
+	if [[ -L "$AGENTS_PATH" ]]; then
+		log_error "Cannot safely update AGENTS.md: $AGENTS_PATH"
+		return 1
+	fi
+
+	if [[ -e "$AGENTS_PATH" ]] && [[ ! -f "$AGENTS_PATH" || ! -r "$AGENTS_PATH" ]]; then
+		log_error "Cannot safely update AGENTS.md: $AGENTS_PATH"
+		return 1
+	fi
+
+	additions_file="$(mktemp)"
+	replacements_file="$(mktemp)"
+	build_missing_agents_entries > "$additions_file"
+	build_managed_agents_replacements > "$replacements_file"
+	addition_count="$(wc -l < "$additions_file")"
+	replacement_count="$(wc -l < "$replacements_file")"
+	begin_count="$(grep -Fxc "$MANAGED_BLOCK_BEGIN" "$AGENTS_PATH" || true)"
+	end_count="$(grep -Fxc "$MANAGED_BLOCK_END" "$AGENTS_PATH" || true)"
+	if [[ "$addition_count" -eq 0 ]] && { [[ "$begin_count" -eq 0 && "$end_count" -eq 0 ]] || [[ "$replacement_count" -eq 0 ]]; }; then
+		rm -f "$additions_file"
+		rm -f "$replacements_file"
+		return 0
+	fi
+
+	if [[ -e "$AGENTS_PATH" && ! -w "$AGENTS_PATH" ]]; then
+		rm -f "$additions_file"
+		rm -f "$replacements_file"
+		log_error "Cannot safely update AGENTS.md: $AGENTS_PATH"
+		return 1
+	fi
+
+	if [[ ! -e "$AGENTS_PATH" ]]; then
+		agents_directory="$(dirname "$AGENTS_PATH")"
+		mkdir -p "$agents_directory"
+		: > "$AGENTS_PATH"
+	fi
+
+	if [[ "$begin_count" -eq 1 && "$end_count" -eq 1 ]]; then
+		temporary_file="$(mktemp)"
+		awk -v begin_marker="$MANAGED_BLOCK_BEGIN" -v end_marker="$MANAGED_BLOCK_END" -v additions_path="$additions_file" -v replacements_path="$replacements_file" '
+			BEGIN {
+				while ((getline replacement < replacements_path) > 0) {
+					separator = index(replacement, "\t")
+					if (separator > 0) {
+						replacement_tool = substr(replacement, 1, separator - 1)
+						replacement_data = substr(replacement, separator + 1)
+						description_separator = index(replacement_data, "\t")
+						if (description_separator > 0) {
+							replacement_display = substr(replacement_data, 1, description_separator - 1)
+							replacement_description = substr(replacement_data, description_separator + 1)
+							display_names[replacement_tool] = replacement_display
+							descriptions[replacement_tool] = replacement_description
+						}
+					}
+				}
+				close(replacements_path)
+				inside_managed_block = 0
+			}
+			$0 == begin_marker {
+				inside_managed_block = 1
+				print
+				next
+			}
+			$0 == end_marker {
+				while ((getline addition < additions_path) > 0) {
+					print addition
+				}
+				close(additions_path)
+				inside_managed_block = 0
+				print
+				next
+			}
+			inside_managed_block {
+				if (substr($0, 1, 3) == "- `") {
+					remainder = substr($0, 4)
+					closing_tick = index(remainder, "`")
+					if (closing_tick > 0) {
+						tool_name = substr(remainder, 1, closing_tick - 1)
+						if (tool_name in descriptions) {
+							command_marker = index($0, ": `")
+							if (command_marker > 0) {
+								command_remainder = substr($0, command_marker + 3)
+								command_end = index(command_remainder, "`")
+								if (command_end > 0) {
+									command_name = substr(command_remainder, 1, command_end - 1)
+									if (descriptions[tool_name] != "") {
+										print sprintf("- `%s`: `%s` - %s", display_names[tool_name], command_name, descriptions[tool_name])
+									} else {
+										print sprintf("- `%s`: `%s`", display_names[tool_name], command_name)
+									}
+									next
+								}
+							}
+						}
+					}
+				}
+			}
+			{ print }
+		' "$AGENTS_PATH" > "$temporary_file"
+	else
+		if [[ "$begin_count" -ne 0 || "$end_count" -ne 0 ]]; then
+			rm -f "$additions_file"
+			rm -f "$replacements_file"
+			log_error "Cannot update incomplete AGENTS.md managed block"
+			return 1
+		fi
+
+		if [[ -s "$AGENTS_PATH" ]]; then
+			last_byte="$(tail -c 1 "$AGENTS_PATH" | od -An -t x1 | tr -d '[:space:]')"
+			if [[ "$last_byte" != "0a" ]]; then
+				printf '\n' >> "$AGENTS_PATH"
+			fi
+		fi
+
+		temporary_file="$(mktemp)"
+		{
+			cat "$AGENTS_PATH"
+			printf '\n%s\n' "$MANAGED_BLOCK_BEGIN"
+			printf '%s\n' '## Installed development tools'
+			cat "$additions_file"
+			printf '%s\n' "$MANAGED_BLOCK_END"
+		} > "$temporary_file"
+	fi
+
+	chmod --reference="$AGENTS_PATH" "$temporary_file" 2>/dev/null || true
+	mv "$temporary_file" "$AGENTS_PATH"
+	rm -f "$additions_file"
+	rm -f "$replacements_file"
+	log_success "Updated the managed development-tools block in $AGENTS_PATH"
+}
+
+# ---
+# Utils Summary
+
+print_summary_rows() {
+	local tool_name=""
+	local result_name=""
+	local result_detail=""
+
+	for tool_name in "${TOOL_NAMES[@]}"; do
+		result_name="${TOOL_RESULTS[$tool_name]:-skipped}"
+		result_detail="${TOOL_RESULT_DETAILS[$tool_name]:-not processed}"
+		printf '  %-10s %-9s %s\n' "$tool_name" "$result_name" "$result_detail"
+	done
+}
+
+print_package_manager_status_rows() {
+	local manager_name=""
+	local result_name=""
+	local result_detail=""
+
+	for manager_name in "${PACKAGE_MANAGER_NAMES[@]}"; do
+		result_name="${PACKAGE_MANAGER_RESULTS[$manager_name]:-unavailable}"
+		result_detail="${PACKAGE_MANAGER_RESULT_DETAILS[$manager_name]:-not processed}"
+		printf '  %-10s %-9s %s\n' "$manager_name" "$result_name" "$result_detail"
+	done
+}
+
+print_summary() {
+	if [[ "$DRY_RUN" -eq 1 ]]; then
+		printf '\n%s\n' 'Development-tool dry-run:'
+	else
+		printf '\n%s\n' 'Development-tool summary:'
+	fi
+	print_summary_rows
+}
+
+print_status_summary() {
+	printf '\n%s\n' 'Package-manager status:'
+	print_package_manager_status_rows
+	printf '\n%s\n' 'Development-tool status:'
+	print_summary_rows
+}
+
+# ---
+# Foundation Main
+
+parse_args() {
+	local mode_seen=0
+
+	DEV_TOOLS_MODE="install"
+	DEV_TOOLS_AGENT="copilot"
+	GLOBAL_INSTALL=0
+	DRY_RUN=0
+	DEBUG_ENABLED=0
+
+	while (($# > 0)); do
+		case "$1" in
+			install|init|status)
+				if [[ "$mode_seen" -eq 1 ]]; then
+					log_error "Only one mode may be specified"
+					return 2
+				fi
+				DEV_TOOLS_MODE="$1"
+				mode_seen=1
+				;;
+			--agent)
+				if [[ "$#" -lt 2 ]]; then
+					log_error "The --agent option requires a value: copilot or cursor"
+					return 2
+				fi
+
+				case "$2" in
+					copilot|cursor)
+					DEV_TOOLS_AGENT="$2"
+					;;
+				*)
+					log_error "Unsupported agent target: $2. Expected copilot or cursor."
+					return 2
+					;;
+				esac
+				shift
+				;;
+			--global)
+				GLOBAL_INSTALL=1
+				;;
+			--debug)
+				DEBUG_ENABLED=1
+				;;
+			--dry-run)
+				DRY_RUN=1
+				;;
+			-h|--help)
+				print_usage
+				return 1
+				;;
+			*)
+				log_error "Unknown argument: $1"
+				return 2
+				;;
+		esac
+		shift
+	done
+
+	if [[ ("$DEV_TOOLS_MODE" == "init" || "$DEV_TOOLS_MODE" == "status") && "$GLOBAL_INSTALL" -eq 1 ]]; then
+		log_error "The --global option is only valid with install mode"
+		return 2
+	fi
+
+	if [[ "$DEV_TOOLS_MODE" != "install" && "$DRY_RUN" -eq 1 ]]; then
+		log_error "The --dry-run option is only valid with install mode"
+		return 2
+	fi
+
+	return 0
+}
+
+main() {
+	local tool_name=""
+	local parse_status=0
+	local agents_status=0
+
+	if parse_args "$@"; then
+		:
+	else
+		parse_status="$?"
+		if [[ "$parse_status" -eq 1 ]]; then
+			return 0
+		fi
+		return "$parse_status"
+	fi
+
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		log_warning "This helper supports Linux and WSL only; skipping optional tools"
+		return 0
+	fi
+
+	TOOL_FAILURE_COUNT=0
+	STATUS_UNAVAILABLE_COUNT=0
+	PACKAGE_MANAGER_RESULTS=()
+	PACKAGE_MANAGER_RESULT_DETAILS=()
+	prepare_known_tool_paths
+	for tool_name in "${TOOL_NAMES[@]}"; do
+		process_tool "$tool_name"
+	done
+
+	if [[ "$DEV_TOOLS_MODE" == "status" ]]; then
+		process_package_manager_status
+	fi
+
+	if [[ "$DEV_TOOLS_MODE" == "install" && "$DRY_RUN" -eq 0 ]]; then
+		if ! update_agents_managed_block; then
+			agents_status=1
+		fi
+	fi
+
+	if [[ "$DEV_TOOLS_MODE" == "status" ]]; then
+		print_status_summary
+		if [[ "$STATUS_UNAVAILABLE_COUNT" -ne 0 ]]; then
+			return 1
+		fi
+		return 0
+	fi
+
+	print_summary
+	if [[ "$agents_status" -ne 0 || "$TOOL_FAILURE_COUNT" -ne 0 ]]; then
+		return 1
+	fi
+
+	return 0
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+	trap 'rm -f -- "$PROTO_TOOL_CAPABILITY_CACHE_FILE"' EXIT
+	main "$@"
+fi
