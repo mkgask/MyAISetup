@@ -1,0 +1,46 @@
+version: "1.0"
+decisions:
+  プラットフォーム:
+    - id: platform-001-supported-host
+      decision: "対象環境はAMD Ryzen AI Max+ 395搭載機上のUbuntu 24.04 LTSに限定する。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+    - id: platform-002-rocm-version-policy
+      decision: "このホストで検証済みの最新ROCm 10.xを優先して正確なバージョンを固定する。必要に応じてアプリ別ROCmユーザー空間を許可し、ホストドライバーとの互換性を確認する。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+      sub_decisions:
+        - id: platform-002-1-compatibility-gate
+          decision: "必須アプリに検証済みランタイム経路がない場合は互換性の問題を明示し、アプリを黙って省略したりホストROCmをダウングレードしたりしない。"
+          status: "⚠️Discussion Approved"
+  アプリケーション:
+    - id: applications-001-supported-ai-stack
+      decision: "llama.cpp、Ollama、vLLM、選定したStable Diffusion WebUIのSD.Next、ComfyUIを対象とする。検証済みのバージョンを固定して導入し、モデルのダウンロードは範囲外とする。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+  ランタイム:
+    - id: runtime-001-per-app-python-pytorch
+      decision: "必要なアプリごとにPythonとPyTorchのバージョンを固定し、環境をアプリ別に保つ。インストール済みのprotoを優先し、なければmiseを使う。どちらもなければ前提不足を明示して停止し、管理ツールは自動導入しない。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+    - id: runtime-002-vllm-build-fallback
+      decision: "互換性のあるstable版vLLM wheelを優先し、なければ上流の固定コミットからビルドして、ビルドとGPUスモークテストを検証する。未固定のnightlyは使わない。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+  インストール:
+    - id: installation-001-installer-contract
+      decision: "ルート直下のinstall.shは引数なしで全体のワンショットセットアップを行い、--helpでUsageを表示し、curl | bashでの実行に対応する。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+      sub_decisions:
+        - id: installation-001-1-install-scope
+          decision: "AIアプリとアプリ別環境はユーザー所有とする。ユーザー権限のグローバル方式があるアプリはそれを使い、なければ実行元プロジェクトディレクトリに配置する。sudoはOSおよびホストROCmの依存関係に限る。"
+          status: "⚠️Discussion Approved"
+        - id: installation-001-2-existing-state
+          decision: "互換性のある既存バージョンを維持し、互換性の問題がある場合は既存インストールを黙って上書きまたはダウングレードせず、明示する。"
+          status: "⚠️Discussion Approved"
+  テスト:
+    - id: testing-001-install-test
+      decision: "ルート直下のinstall.test.shはsudoや実際のシステムインストールを行わずにインストーラーの挙動を検証する。"
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"

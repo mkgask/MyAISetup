@@ -29,6 +29,8 @@
 ## records history for this repository
 
 [records/](records/)
+- [local-ai-setup-baseline.md](records/local-ai-setup-baseline.md)
+- [日本語版](.docs/ja/records/local-ai-setup-baseline.md)
 
 
 

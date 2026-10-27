@@ -1,68 +1,46 @@
-# DECISIONS.yml
-# Current active decision list (mutable) for DOD (Decision Oriented Development)
-# Use this file as the canonical list of active project decisions and implementation constraints.
-# Keep the default decision shape lightweight so humans can scan the list quickly.
-# Put background, trade-offs, rejected options, and research notes in records/{discussion-id}.md.
-# records/{discussion-id}.md is discussion history only: do not put mutable tracking fields there
-# (status, remaining work, or open action items that require later updates).
-# Keep decision contracts explicit here only when they actively constrain implementation.
-# When contract details need their own active rule, add them as small sub-decisions instead of
-# forcing the same contract fields onto every decision node.
-
 version: "1.0"
 decisions:
-
-  # Replace this category name with a concern area or domain that groups related decisions.
-  # Good defaults include Feature, Infrastructure, Business Logic, Security, Data, and CI/CD.
-  # Prefer the top level to express what area the decisions belong to.
-  # Keep specification, design, implementation, and test concerns as decision objects or
-  # sub-decisions inside that area when they independently constrain implementation.
-  Category Name:
-    - # Required. Use a stable ID such as {category}-{sequence}-{shortname}.
-      id: category-001-short-name
-      # Required. Use one decision field that keeps name and binding content together.
-      # Keep it concise and scannable; up to about 3 lines when needed.
-      decision: Describe the decision and its current binding constraint in one field
-      # Optional. Prefer one of the default statuses below.
-      # - ⚠️Discussion In Progress
-      # - ⚠️Discussion Approved
-      # - ⚠️Implementing
-      # - ✅️Implementation Approved
-      # Use exceptional states such as ⛔️On Hold or ⛔️Cancelled only when needed.
-      status: "⚠️Discussion In Progress"
-      # Optional. Point to the related discussion record when this decision family comes from one discussion.
-      link: "records/category-001-discussion-topic.md"
-      # Optional. Add children only when a contract detail or rule becomes independently active.
-      # Use sub-decisions for invariants, non-goals, acceptance criteria, or failure conditions
-      # only when those details need to be referenced on their own.
-      # Example:
-      # sub_decisions:
-      #   - id: category-001-1-contract-detail
-      #     decision: Describe one independently active contract detail and why it currently constrains implementation
-      #     status: "⚠️Discussion Approved"
-      #     sub_decisions: []
-      sub_decisions: []
-
-  # Example:
-  # Feature:
-  #   - id: feature-001-profile-editing
-  #     decision: User profile editing capability. This feature currently constrains UI, API, and validation work across the app
-  #     status: "⚠️Implementing"
-  #     link: "records/feature-001-profile-editing.md"
-  #     sub_decisions:
-  #       - id: feature-001-1-spec-fields
-  #         decision: Editable fields and validation rules. The API and form schema must agree on allowed fields before implementation
-  #         status: "⚠️Discussion Approved"
-  #         sub_decisions: []
-  #       - id: feature-001-2-design-boundary
-  #         decision: Server and client responsibility boundary. Component structure and mutation flow depend on this boundary
-  #         status: "⚠️Implementing"
-  #         sub_decisions: []
-  #       - id: feature-001-3-test-acceptance
-  #         decision: Acceptance coverage for success and rejection paths. The feature is incomplete unless valid updates succeed and invalid input is rejected
-  #         status: "⚠️Discussion Approved"
-  #         sub_decisions: []
-
-  # Add more categories and decision objects as needed.
-  # Prefer many small decisions over one overloaded entry.
-  # Every rule that can change the next implementation decision should exist here.
+  Platform:
+    - id: platform-001-supported-host
+      decision: "Support only Ubuntu 24.04 LTS on AMD Ryzen AI Max+ 395."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+    - id: platform-002-rocm-version-policy
+      decision: "Prioritize the newest ROCm 10.x release validated for this host, pin exact versions, and allow app-specific ROCm user-space when needed; verify compatibility with the host driver."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+      sub_decisions:
+        - id: platform-002-1-compatibility-gate
+          decision: "If a required app has no validated runtime path, report the incompatibility; do not silently omit the app or downgrade host ROCm."
+          status: "⚠️Discussion Approved"
+  Applications:
+    - id: applications-001-supported-ai-stack
+      decision: "Support llama.cpp, Ollama, vLLM, SD.Next (the selected Stable Diffusion WebUI), and ComfyUI. Install validated, pinned releases; model downloads are out of scope."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+  Runtime:
+    - id: runtime-001-per-app-python-pytorch
+      decision: "Where required, pin Python and PyTorch per application and keep environments app-local. Use installed proto first, otherwise mise; if neither exists, report a prerequisite error and stop without installing a manager."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+    - id: runtime-002-vllm-build-fallback
+      decision: "Use a compatible stable vLLM wheel when available; otherwise build from a pinned upstream commit and validate the build and GPU smoke test. Do not use an unpinned nightly."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+  Installation:
+    - id: installation-001-installer-contract
+      decision: "Root install.sh runs the full one-shot setup with no arguments, displays usage for --help, and supports curl | bash."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
+      sub_decisions:
+        - id: installation-001-1-install-scope
+          decision: "Keep AI apps and per-app environments user-owned. Use an app's user-level global mode when available; otherwise install it under the invoking project directory. Use sudo only for OS and host ROCm dependencies."
+          status: "⚠️Discussion Approved"
+        - id: installation-001-2-existing-state
+          decision: "Preserve compatible existing versions; report incompatibilities instead of silently overwriting or downgrading an existing installation."
+          status: "⚠️Discussion Approved"
+  Testing:
+    - id: testing-001-install-test
+      decision: "The root install.test.sh tests installer behavior without sudo or real system installations."
+      status: "⚠️Discussion Approved"
+      link: "records/local-ai-setup-baseline.md"
